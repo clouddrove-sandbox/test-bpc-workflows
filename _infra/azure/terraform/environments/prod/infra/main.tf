@@ -6,6 +6,7 @@ resource "azurerm_resource_group" "workflow_test" {
     Project      = "bpc-workflow-test"
     Environment  = "workflow-test"
     ManagedBy    = "terraform"
+    CreatedBy    = "github-actions"
     CostCenter   = var.cost_center
     Owner        = var.owner
     Compliance   = var.compliance
