@@ -1,0 +1,289 @@
+# One Terraform root: plan and policy checks in the root's <root>-plan GitHub
+# Environment (no reviewers), and, when `apply` is set, an apply of exactly that
+# plan in the root's own GitHub Environment (approval gate).
+# Called by terraform-landing-zone.yml, terraform-dev.yml and terraform-prod.yml.
+# Setup: _infra/azure/terraform/bootstrap/README.md, "GitHub Actions pipeline".
+name: Terraform root (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      root:
+        type: string
+        required: true
+        description: landing-zone, dev or prod.
+      apply:
+        type: boolean
+        default: false
+        description: Keep the plan and apply it in the root's GitHub Environment.
+    secrets:
+      VPN_SHARED_KEYS:
+        required: false
+      FIREWALL_BOOTSTRAP_CUSTOM_DATA:
+        required: false
+
+env:
+  TF_VERSION: 1.15.3
+  WORKDIR: _infra/azure/terraform/environments/${{ inputs.root }}/infra
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  # Terraform signs in to Azure and to the state account with the job's GitHub
+  # OIDC token. The state account lives in the bpc_landing_zone subscription.
+  ARM_USE_OIDC: "true"
+  ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID_LANDING_ZONE }}
+  # Resource providers are registered once by an operator (docs/03-prerequisites.md);
+  # the plan identities are Reader only and cannot register them.
+  ARM_RESOURCE_PROVIDER_REGISTRATIONS: none
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    # The plan identity trusts only this environment. It has no reviewers, so
+    # plans run on every branch.
+    environment: ${{ inputs.root }}-plan
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+    outputs:
+      changes: ${{ steps.plan.outputs.changes }}
+      artifact-name: ${{ steps.artifact.outputs.name }}
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - uses: ./.github/actions/setup-conftest
+
+      # The CI equivalent of the local terraform.tfvars. Names follow the bootstrap
+      # outputs: <NAME>_LANDING_ZONE, <NAME>_DEV, <NAME>_PROD.
+      - name: Configure inputs
+        env:
+          ROOT: ${{ inputs.root }}
+          VARS: ${{ toJSON(vars) }}
+        run: |
+          key=$(tr 'a-z-' 'A-Z_' <<<"$ROOT")
+          missing=()
+          set_from() { # <env name> <repository variable> [optional]
+            local value
+            value=$(jq -r --arg k "$2" '.[$k] // empty' <<<"$VARS")
+            if [ -n "$value" ]; then
+              echo "$1=$value" >> "$GITHUB_ENV"
+            elif [ "${3:-}" != optional ]; then
+              missing+=("$2")
+            fi
+          }
+
+          set_from ARM_CLIENT_ID "AZURE_PLAN_CLIENT_ID_$key"
+          set_from TF_VAR_tenant_id AZURE_TENANT_ID
+          set_from TF_VAR_connectivity_subscription_id AZURE_SUBSCRIPTION_ID_LANDING_ZONE
+          if [ "$ROOT" != landing-zone ]; then
+            set_from TF_VAR_subscription_id "AZURE_SUBSCRIPTION_ID_$key"
+          fi
+          set_from TF_VAR_cost_center TAG_COST_CENTER
+          set_from TF_VAR_owner TAG_OWNER
+          set_from TF_VAR_compliance TAG_COMPLIANCE
+          set_from TF_VAR_repository_url TAG_REPOSITORY_URL
+
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::Repository variables not set: ${missing[*]}"
+            exit 1
+          fi
+
+      - name: Init
+        working-directory: ${{ env.WORKDIR }}
+        run: terraform init -lockfile=readonly
+
+      - name: Plan
+        id: plan
+        working-directory: ${{ env.WORKDIR }}
+        env:
+          VPN_SHARED_KEYS: ${{ secrets.VPN_SHARED_KEYS }}
+          FIREWALL_BOOTSTRAP_CUSTOM_DATA: ${{ secrets.FIREWALL_BOOTSTRAP_CUSTOM_DATA }}
+        run: |
+          # Landing Zone secrets. Unset ones keep the variable defaults.
+          if [ -n "$VPN_SHARED_KEYS" ]; then
+            export TF_VAR_vpn_shared_keys="$VPN_SHARED_KEYS"
+          fi
+          if [ -n "$FIREWALL_BOOTSTRAP_CUSTOM_DATA" ]; then
+            export TF_VAR_firewall_bootstrap_custom_data="$FIREWALL_BOOTSTRAP_CUSTOM_DATA"
+          fi
+
+          set +e
+          terraform plan -lock-timeout=10m -out=tfplan -detailed-exitcode
+          code=$?
+          set -e
+          case $code in
+            0) echo "changes=false" >> "$GITHUB_OUTPUT" ;;
+            2) echo "changes=true" >> "$GITHUB_OUTPUT" ;;
+            *) exit "$code" ;;
+          esac
+
+      - name: Policy checks and summary
+        id: summary
+        working-directory: ${{ env.WORKDIR }}
+        env:
+          ROOT: ${{ inputs.root }}
+          POLICY_DIR: ${{ github.workspace }}/_infra/azure/policy/terraform
+        run: |
+          # plan.json holds sensitive values in clear text; never keep it.
+          trap 'rm -f plan.json' EXIT
+          terraform show -json tfplan > plan.json
+
+          counts=$(jq -r '[.resource_changes[]?.change.actions | sort | join(",")] |
+            "\(map(select(. == "create")) | length) to add, \(map(select(. == "update")) | length) to change, \(map(select(. == "create,delete")) | length) to replace, \(map(select(. == "delete")) | length) to destroy"' plan.json)
+          risky=$(jq -r '.resource_changes[]? | select(.change.actions | index("delete")) | .address' plan.json)
+
+          set +e
+          policy=$(conftest test --policy "$POLICY_DIR" --all-namespaces --no-color plan.json 2>&1)
+          policy_code=$?
+          set -e
+
+          terraform show -no-color tfplan > "$RUNNER_TEMP/plan.txt"
+          fence="\`\`\`"
+          {
+            echo "<!-- terraform-plan:$ROOT -->"
+            echo "### Terraform plan: \`$ROOT\`"
+            echo
+            if [ "$policy_code" -eq 0 ]; then status=passed; else status="**failed**"; fi
+            echo "**$counts** · policy checks $status"
+            if [ -n "$risky" ]; then
+              echo
+              echo "> [!WARNING]"
+              echo "> Destroys or replaces the resources below. Stop unless each one is explained (docs/05-operations.md, section 1)."
+              while read -r address; do echo "> - \`$address\`"; done <<<"$risky"
+            fi
+            echo
+            echo "<details><summary>Policy checks</summary>"
+            echo
+            echo "$fence"
+            echo "$policy"
+            echo "$fence"
+            echo "</details>"
+            echo "<details><summary>Plan</summary>"
+            echo
+            echo "$fence"
+            head -c 50000 "$RUNNER_TEMP/plan.txt"
+            if [ "$(wc -c < "$RUNNER_TEMP/plan.txt")" -gt 50000 ]; then
+              echo
+              echo "... truncated; the full plan is in the job log."
+            fi
+            echo "$fence"
+            echo "</details>"
+          } > "$RUNNER_TEMP/plan.md"
+          cat "$RUNNER_TEMP/plan.md" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -n "$risky" ]; then
+            echo "::warning title=$ROOT plan destroys or replaces resources::$(tr '\n' ' ' <<<"$risky")"
+          fi
+          echo "$policy"
+          exit "$policy_code"
+
+      # Pull request: comment on it. Branch push: update the comment on the
+      # branch's open pull request, if there is one.
+      - name: Comment on pull request
+        if: ${{ !cancelled() && (github.event_name == 'pull_request' || github.event_name == 'push') && (steps.summary.outcome == 'success' || steps.summary.outcome == 'failure') }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync(`${process.env.RUNNER_TEMP}/plan.md`, 'utf8').slice(0, 65000);
+            const marker = body.split('\n')[0];
+            const { owner, repo } = context.repo;
+            let issue_number = context.issue.number;
+            if (context.eventName === 'push') {
+              const branch = context.ref.replace('refs/heads/', '');
+              const { data: pulls } = await github.rest.pulls.list({ owner, repo, state: 'open', head: `${owner}:${branch}` });
+              if (pulls.length === 0) return;
+              issue_number = pulls[0].number;
+            }
+            const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number });
+            const existing = comments.find(c => c.user.type === 'Bot' && c.body.startsWith(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+
+      # The plan file can contain sensitive values: kept for one day at most and
+      # deleted by the apply job.
+      - name: Name plan artifact
+        id: artifact
+        if: inputs.apply && steps.plan.outputs.changes == 'true'
+        run: echo "name=tfplan-${{ inputs.root }}-${{ github.run_attempt }}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload plan
+        id: upload
+        if: inputs.apply && steps.plan.outputs.changes == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.artifact.outputs.name }}
+          path: ${{ env.WORKDIR }}/tfplan
+          retention-days: 1
+          if-no-files-found: error
+
+  apply:
+    name: apply
+    needs: plan
+    if: inputs.apply && needs.plan.outputs.changes == 'true'
+    runs-on: ubuntu-latest
+    # Required reviewers and the main-only branch rule are set on this environment.
+    environment: ${{ inputs.root }}
+    permissions:
+      contents: read
+      id-token: write
+      actions: write
+    env:
+      ARM_CLIENT_ID: ${{ vars.AZURE_APPLY_CLIENT_ID }}
+    steps:
+      - name: Check identity
+        if: env.ARM_CLIENT_ID == ''
+        env:
+          ROOT: ${{ inputs.root }}
+        run: |
+          echo "::error::Variable AZURE_APPLY_CLIENT_ID is not set on the $ROOT environment"
+          exit 1
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ needs.plan.outputs.artifact-name }}
+          path: ${{ env.WORKDIR }}
+
+      - name: Init
+        working-directory: ${{ env.WORKDIR }}
+        run: terraform init -lockfile=readonly
+
+      # A saved plan refuses to apply if the state changed since it was made.
+      - name: Apply
+        working-directory: ${{ env.WORKDIR }}
+        run: terraform apply -lock-timeout=10m tfplan
+
+      - name: Delete plan artifact
+        if: always()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          ARTIFACT_ID: ${{ needs.plan.outputs.artifact-id }}
+        with:
+          script: |
+            await github.rest.actions.deleteArtifact({ ...context.repo, artifact_id: Number(process.env.ARTIFACT_ID) });

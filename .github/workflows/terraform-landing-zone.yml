@@ -1,0 +1,64 @@
+# Terraform for the landing-zone root (bpc_landing_zone subscription).
+#
+# Push to any branch: plan and policy checks; shown in the run summary and on the
+# branch's open pull request. No apply.
+# Pull request opened to main: the same plan, posted as a comment for the reviewer.
+# Push to main: plan, then apply after approval in the `landing-zone` GitHub Environment.
+# Manual run: plan; apply only from main with `apply` ticked.
+#
+# DEV and PROD read this root's state: approve this apply before theirs
+# (docs/05-operations.md, section 2).
+# Setup: _infra/azure/terraform/bootstrap/README.md, "GitHub Actions pipeline".
+name: Terraform landing-zone
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - _infra/azure/terraform/environments/landing-zone/**
+      - _infra/azure/terraform/_modules/**
+      - _infra/azure/policy/terraform/**
+      - .github/workflows/terraform-landing-zone.yml
+      - .github/workflows/reusable-terraform-root.yml
+      - .github/actions/setup-conftest/**
+  # Later pushes to the branch update the comment through the push run.
+  pull_request:
+    branches: [main, master]
+    types: [opened, reopened, ready_for_review]
+    paths:
+      - _infra/azure/terraform/environments/landing-zone/**
+      - _infra/azure/terraform/_modules/**
+      - _infra/azure/policy/terraform/**
+      - .github/workflows/terraform-landing-zone.yml
+      - .github/workflows/reusable-terraform-root.yml
+      - .github/actions/setup-conftest/**
+  workflow_dispatch:
+    inputs:
+      apply:
+        type: boolean
+        description: Apply after approval (default branch only).
+        default: false
+
+# Branches and pull requests: the newest commit wins. Default branch: runs
+# queue, never cancelled mid-apply.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_name != github.event.repository.default_branch }}
+
+permissions: {}
+
+jobs:
+  landing-zone:
+    name: landing-zone
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+      actions: write
+    uses: ./.github/workflows/reusable-terraform-root.yml
+    with:
+      root: landing-zone
+      apply: ${{ github.ref_name == github.event.repository.default_branch && (github.event_name == 'push' || inputs.apply) }}
+    secrets:
+      VPN_SHARED_KEYS: ${{ secrets.VPN_SHARED_KEYS }}
+      FIREWALL_BOOTSTRAP_CUSTOM_DATA: ${{ secrets.FIREWALL_BOOTSTRAP_CUSTOM_DATA }}
