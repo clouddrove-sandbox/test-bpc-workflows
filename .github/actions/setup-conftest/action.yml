@@ -1,0 +1,19 @@
+name: Set up conftest
+description: Install a pinned, checksum-verified conftest release and add it to PATH.
+
+runs:
+  using: composite
+  steps:
+    - name: Install conftest
+      shell: bash
+      env:
+        VERSION: 0.71.1
+        SHA256: c3f6b2a753bd56e377a1e51a95ae3e057f926f2e9139f7d5b5dfbbaf810f7985
+      run: |
+        archive="$RUNNER_TEMP/conftest.tar.gz"
+        curl -fsSLo "$archive" "https://github.com/open-policy-agent/conftest/releases/download/v${VERSION}/conftest_${VERSION}_Linux_x86_64.tar.gz"
+        echo "${SHA256}  ${archive}" | sha256sum --check --quiet
+        mkdir -p "$RUNNER_TEMP/conftest"
+        tar -xzf "$archive" -C "$RUNNER_TEMP/conftest" conftest
+        rm -f "$archive"
+        echo "$RUNNER_TEMP/conftest" >> "$GITHUB_PATH"

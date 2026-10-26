@@ -1,0 +1,81 @@
+# Static checks for the Terraform roots and policy rules: fmt, validate,
+# tflint and the policy unit tests. No Azure access. Make it a required status
+# check on main so nothing that fails it is merged and applied.
+name: Terraform checks
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - _infra/azure/**
+      - .github/workflows/terraform-checks.yml
+      - .github/actions/setup-conftest/**
+  pull_request:
+    branches: [main, master]
+    paths:
+      - _infra/azure/**
+      - .github/workflows/terraform-checks.yml
+      - .github/actions/setup-conftest/**
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  checks:
+    name: static checks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: 1.15.3
+          terraform_wrapper: false
+
+      - uses: terraform-linters/setup-tflint@6ffdbaa3be476b3431f7275c26966ef32ff60337 # v6.3.2
+        with:
+          tflint_version: v0.61.0
+
+      - uses: ./.github/actions/setup-conftest
+
+      - name: Format
+        working-directory: _infra/azure/terraform
+        run: terraform fmt -check -recursive -diff
+
+      - name: Init and validate
+        working-directory: _infra/azure/terraform
+        run: |
+          export TF_PLUGIN_CACHE_DIR="$RUNNER_TEMP/plugin-cache"
+          mkdir -p "$TF_PLUGIN_CACHE_DIR"
+          # Initialize every environment root so tflint can follow module calls.
+          find environments -name versions.tf -not -path '*/.terraform/*' -exec dirname {} \; | sort | while read -r dir; do
+            echo "::group::init $dir"
+            terraform -chdir="$dir" init -backend=false -lockfile=readonly
+            echo "::endgroup::"
+          done
+          for dir in environments/*/infra; do
+            terraform -chdir="$dir" validate
+          done
+
+      - name: tflint
+        working-directory: _infra/azure/terraform
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          tflint --init
+          tflint --recursive --config "$PWD/.tflint.hcl"
+
+      - name: Policy unit tests
+        working-directory: _infra/azure/policy
+        run: conftest verify --policy terraform
